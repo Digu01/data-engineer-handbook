@@ -1,0 +1,122 @@
+1. DDL for actors Table
+The actors table will have the following schema:
+CREATE TABLE actors (
+    actorid INT PRIMARY KEY,
+    actor_name VARCHAR(255),
+    films ARRAY<STRUCT<film STRING, votes INT, rating FLOAT, filmid INT>>,
+    quality_class STRING,
+    is_active BOOLEAN
+);
+
+
+2. Cumulative Table Generation Query
+This query will populate the actors table year by year. Assuming the source dataset is named actor_films, the query will calculate the required fields dynamically.
+WITH recent_years AS (
+    SELECT
+        actorid,
+        MAX(year) AS recent_year
+    FROM actor_films
+    GROUP BY actorid
+),
+actor_quality AS (
+    SELECT
+        af.actorid,
+        af.actor AS actor_name,
+        ARRAY_AGG(
+            STRUCT(
+                af.film AS film,
+                af.votes AS votes,
+                af.rating AS rating,
+                af.filmid AS filmid
+            )
+        ) AS films,
+        CASE
+            WHEN AVG(af.rating) > 8 THEN 'star'
+            WHEN AVG(af.rating) > 7 THEN 'good'
+            WHEN AVG(af.rating) > 6 THEN 'average'
+            ELSE 'bad'
+        END AS quality_class,
+        MAX(af.year) = EXTRACT(YEAR FROM CURRENT_DATE) AS is_active
+    FROM actor_films af
+    GROUP BY af.actorid, af.actor
+)
+SELECT *
+FROM actor_quality;
+
+The query:
+
+Aggregates films into a nested structure.
+Computes the quality_class based on the average rating.
+Determines is_active status by comparing the latest year with the current year.
+
+
+3. DDL for actors_history_scd Table
+The actors_history_scd table is designed for slowly changing dimensions (SCD Type 2), tracking changes in quality_class and is_active over time.
+CREATE TABLE actors_history_scd (
+    actorid INT,
+    actor_name VARCHAR(255),
+    quality_class STRING,
+    is_active BOOLEAN,
+    start_date DATE,
+    end_date DATE,
+    PRIMARY KEY (actorid, start_date)
+);
+
+
+4. Backfill Query for actors_history_scd Table
+This query populates the entire actors_history_scd table by calculating historical records.
+
+
+WITH actor_changes AS (
+    SELECT
+        af.actorid,
+        af.actor AS actor_name,
+        CASE
+            WHEN AVG(af.rating) > 8 THEN 'star'
+            WHEN AVG(af.rating) > 7 THEN 'good'
+            WHEN AVG(af.rating) > 6 THEN 'average'
+            ELSE 'bad'
+        END AS quality_class,
+        MAX(af.year) = EXTRACT(YEAR FROM CURRENT_DATE) AS is_active,
+        MIN(af.year) AS start_date,
+        NULL AS end_date
+    FROM actor_films af
+    GROUP BY af.actorid, af.actor
+)
+SELECT *
+FROM actor_changes;
+
+This query computes historical changes for each actor, assigning start_date as the first year and leaving end_date NULL for active records.
+
+
+5. Incremental Query for actors_history_scd Table
+This query updates the actors_history_scd table incrementally by merging new data and updating historical records.
+
+MERGE INTO actors_history_scd AS scd
+USING (
+    SELECT
+        af.actorid,
+        af.actor AS actor_name,
+        CASE
+            WHEN AVG(af.rating) > 8 THEN 'star'
+            WHEN AVG(af.rating) > 7 THEN 'good'
+            WHEN AVG(af.rating) > 6 THEN 'average'
+            ELSE 'bad'
+        END AS quality_class,
+        MAX(af.year) = EXTRACT(YEAR FROM CURRENT_DATE) AS is_active,
+        EXTRACT(YEAR FROM CURRENT_DATE) AS start_date
+    FROM actor_films af
+    WHERE af.year = EXTRACT(YEAR FROM CURRENT_DATE)
+    GROUP BY af.actorid, af.actor
+) AS new_data
+ON scd.actorid = new_data.actorid AND scd.end_date IS NULL
+WHEN MATCHED AND (scd.quality_class != new_data.quality_class OR scd.is_active != new_data.is_active)
+    THEN UPDATE SET scd.end_date = new_data.start_date - INTERVAL 1 DAY
+WHEN NOT MATCHED
+    THEN INSERT (actorid, actor_name, quality_class, is_active, start_date, end_date)
+    VALUES (new_data.actorid, new_data.actor_name, new_data.quality_class, new_data.is_active, new_data.start_date, NULL);
+
+This query:
+
+Updates the end_date for old records if changes occur.
+Inserts new records with the current year's data.
